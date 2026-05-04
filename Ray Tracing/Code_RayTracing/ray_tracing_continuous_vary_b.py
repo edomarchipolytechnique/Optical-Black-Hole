@@ -5,7 +5,7 @@ import warnings
 from matplotlib.colors import Normalize
 
 
-from Kerr_Newman import (
+from other_methods.Kerr_Newman import (
     refractive_index_kn_continuous,
     kerr_newman_radius,
     kerr_newman_photon_sphere,
@@ -15,21 +15,23 @@ from Schwarzchild import refractive_index_schwarzschild
 from geodesics import schwarzschild_geodesic_xy, kerr_newman_geodesic_xy
 
 
-METRIC_TYPE = "schwarzschild"   # "schwarzschild" or "kerr_newman"
+METRIC_TYPE = "kerr_newman"   # "schwarzschild" or "kerr_newman"
 
-B_NOMINAL = 1.0            # Nominal (central) impact parameter
+B_NOMINAL = 5.409            # Nominal (central) impact parameter
 R_HORIZON = 2.0            # Schwarzschild event horizon radius (Schwarzschild mode only)
 R_START   = 500.0          # Starting radius — must be far in the asymptotic regime
 R_PLOT_MAX = 6.0           # Reference radius for refractive-index normalisation
 
-KERR_A      = 0.4          # Dimensionless spin  (a)
-KERR_CHARGE = 0.8          # Charge parameter    (Q)
+KERR_A      = 0          # Dimensionless spin  (a)
+KERR_CHARGE = 1.0          # Charge parameter    (Q)
 
 STEP_SIZE = 0.05           # Affine-parameter step ds
 MAX_STEPS = 20000          # Maximum RK4 steps
 
-DELTA_B_MIN    = -0.5      # Minimum  delta_b
-DELTA_B_MAX    =  0.5      # Maximum  delta_b
+DELTA_B_RATIO_MIN = -0.1     # Minimum fractional delta_b / |b_ref|
+DELTA_B_RATIO_MAX =  0.1     # Maximum fractional delta_b / |b_ref|
+DELTA_B_MIN    = DELTA_B_RATIO_MIN * np.abs(B_NOMINAL)      # Minimum delta_b
+DELTA_B_MAX    = DELTA_B_RATIO_MAX * np.abs(B_NOMINAL)      # Maximum delta_b
 N_DELTA_VALUES =  200      # Number of delta_b values
 
 PLOT_XLIM = (-6, 6)
@@ -186,6 +188,66 @@ def compute_geodesic(b_nominal, actual_event_horizon):
     return x_geo, y_geo, r_geo, phi_geo
 
 
+def compute_geodesic_error_reference(b_nominal, actual_event_horizon):
+    """
+    Geodesic in the same convention used by other_methods:
+    rho starts at R_PLOT_MAX and phi starts from 0 at that radius.
+    """
+    if METRIC_TYPE == "schwarzschild":
+        _, _, r_geo, phi_geo = schwarzschild_geodesic_xy(
+            b_inf=b_nominal,
+            P0=R_PLOT_MAX,
+            P_end=R_HORIZON,
+        )
+
+    elif METRIC_TYPE == "kerr_newman":
+        ell_sign = int(np.sign(b_nominal)) if b_nominal != 0 else +1
+        _, _, r_geo, phi_geo = kerr_newman_geodesic_xy(
+            a=KERR_A,
+            rho_Q=KERR_CHARGE,
+            b_inf=b_nominal,
+            ell_sign=ell_sign,
+            P0=R_PLOT_MAX,
+            P_end=actual_event_horizon,
+        )
+    else:
+        raise ValueError(f"Unknown METRIC_TYPE: {METRIC_TYPE!r}")
+
+    min_r_idx = np.argmin(r_geo)
+    return r_geo[:min_r_idx + 1], phi_geo[:min_r_idx + 1]
+
+
+def _ray_error_coordinates(x_path, y_path, r_outer=R_PLOT_MAX):
+    """
+    Convert a Cartesian continuous ray to the rho/phi convention used by
+    other_methods.ray_trace: ingoing branch only, phi=0 at r_outer.
+    """
+    r_path = np.sqrt(x_path**2 + y_path**2)
+    min_r_idx = np.argmin(r_path)
+
+    r_ing = r_path[:min_r_idx + 1]
+    theta_ing = np.unwrap(np.arctan2(y_path[:min_r_idx + 1], x_path[:min_r_idx + 1]))
+
+    if len(r_ing) < 2 or r_ing.min() >= r_outer:
+        return np.array([]), np.array([])
+
+    sort_idx = np.argsort(r_ing)
+    r_sorted = r_ing[sort_idx]
+    theta_sorted = theta_ing[sort_idx]
+
+    theta_outer = np.interp(r_outer, r_sorted, theta_sorted)
+    keep = r_ing <= r_outer
+
+    r_ray = np.concatenate(([r_outer], r_ing[keep]))
+    phi_ray = np.concatenate(([0.0], theta_outer - theta_ing[keep]))
+
+    order = np.argsort(r_ray)
+    _, unique_idx = np.unique(r_ray[order], return_index=True)
+    keep_order = order[unique_idx]
+
+    return r_ray[keep_order], phi_ray[keep_order]
+
+
 
 
 def crosses_radius(r_array, r_val):
@@ -212,28 +274,59 @@ def _interp_phi_at_r(r_query, r_path, phi_path):
     return np.interp(r_query, r_path[sort_idx], phi_path[sort_idx])
 
 
+def _symmetric_error_scale(finite_errors, min_span=1.0, max_span=30.0, percentile=98.0):
+    """
+    Return a readable symmetric color scale for signed angular errors.
+    Uses a high percentile so one extreme ray does not wash out smaller
+    variations, while still showing clipped extremes via colorbar extension.
+    """
+    if finite_errors.size == 0:
+        return -min_span, min_span
+
+    max_abs = np.nanpercentile(np.abs(finite_errors), percentile)
+    if not np.isfinite(max_abs) or max_abs == 0:
+        max_abs = np.nanmax(np.abs(finite_errors))
+
+    if not np.isfinite(max_abs) or max_abs == 0:
+        max_abs = min_span
+
+    max_abs = min(max(max_abs, min_span), max_span)
+    return -max_abs, max_abs
+
+
 
 def create_error_analysis_figure(
     obh,
     b_nominal,
     actual_event_horizon,
-    delta_b_range=(-0.5, 0.5),
+    delta_b_ratio_range=(DELTA_B_RATIO_MIN, DELTA_B_RATIO_MAX),
     n_delta_values=N_DELTA_VALUES,
 ):
    
-    delta_b_values = np.linspace(delta_b_range[0], delta_b_range[1], n_delta_values)
+    b_reference_abs = np.abs(b_nominal)
+    if b_reference_abs == 0:
+        raise ValueError("b_nominal must be nonzero for a relative delta_b scan")
+
+    db_ratio_min = max(delta_b_ratio_range[0], DELTA_B_RATIO_MIN)
+    db_ratio_max = min(delta_b_ratio_range[1], DELTA_B_RATIO_MAX)
+    if db_ratio_min >= db_ratio_max:
+        raise ValueError("delta_b_ratio_range must overlap [-0.1, 0.1]")
+
+    delta_b_ratios = np.linspace(db_ratio_min, db_ratio_max, n_delta_values)
+    delta_b_values = delta_b_ratios * b_reference_abs
 
     fig, (ax_traj, ax_error) = plt.subplots(1, 2, figsize=(16, 7))
 
-    max_abs_delta_b = max(abs(delta_b_range[0]), abs(delta_b_range[1]))
+    max_abs_delta_b_ratio = max(abs(db_ratio_min), abs(db_ratio_max))
     cmap_rays = plt.cm.plasma_r
-    norm_rays = Normalize(vmin=0.0, vmax=max_abs_delta_b)
+    norm_rays = Normalize(vmin=0.0, vmax=max_abs_delta_b_ratio)
 
     x_geo, y_geo, r_geo, phi_geo = compute_geodesic(b_nominal, actual_event_horizon)
     y_plot_sign = -1.0 if b_nominal < 0 else 1.0
-    geo_sort_idx = np.argsort(r_geo)
-    r_geo_sorted = r_geo[geo_sort_idx]
-    phi_geo_sorted = phi_geo[geo_sort_idx]
+    r_geo_error, phi_geo_error = compute_geodesic_error_reference(
+        b_nominal,
+        actual_event_horizon,
+    )
     ax_traj.plot(
         x_geo,
         y_plot_sign * y_geo,
@@ -246,9 +339,9 @@ def create_error_analysis_figure(
 
     r_sim_max           = 0.0   # largest simulated horizon seen — drives the disk size
     any_counter_rotating = False
-    error_data           = []   # list of (delta_b, r_sample, delta_phi_deg)
+    error_data           = []   # list of (delta_b / |b_ref|, r_sample, delta_phi_deg)
 
-    for i, delta_b in enumerate(delta_b_values):
+    for i, (delta_b_ratio, delta_b) in enumerate(zip(delta_b_ratios, delta_b_values)):
         if i % 10 == 0:
             print(f"  Progress: {i}/{n_delta_values}")
 
@@ -266,33 +359,28 @@ def create_error_analysis_figure(
         if len(x) < 2:
             continue
 
-        color = cmap_rays(norm_rays(abs(delta_b)))
+        color = cmap_rays(norm_rays(abs(delta_b_ratio)))
         ax_traj.plot(x, y_plot_sign * y, color=color, alpha=0.5, linewidth=1.5)
 
-        r   = np.sqrt(x**2 + y**2)
-        phi = np.arctan2(y, x)
+        r_sample_all, phi_ray_all = _ray_error_coordinates(x, y)
 
-        r_common_min = max(r_geo.min(), r.min())
-        r_common_max = min(r_geo.max(), r.max())
+        if len(r_sample_all) < 2:
+            continue
+
+        r_common_min = max(r_geo_error.min(), r_sample_all.min())
+        r_common_max = min(r_geo_error.max(), r_sample_all.max())
 
         if r_common_min >= r_common_max:
             continue
 
-        r_sample = np.linspace(r_common_min, r_common_max, 100)
+        common_mask = ((r_sample_all >= r_common_min)
+                       & (r_sample_all <= r_common_max))
+        r_sample = r_sample_all[common_mask]
+        phi_ray_at_sample = phi_ray_all[common_mask]
+        phi_geo_at_sample = np.interp(r_sample, r_geo_error[::-1], phi_geo_error[::-1])
+        delta_phi_deg = np.degrees(phi_ray_at_sample - phi_geo_at_sample)
 
-        ray_sort_idx = np.argsort(r)
-        r_sorted = r[ray_sort_idx]
-        phi_sorted = phi[ray_sort_idx]
-        phi_geo_at_sample = np.interp(r_sample, r_geo_sorted, phi_geo_sorted)
-        phi_ray_at_sample = np.interp(r_sample, r_sorted, phi_sorted)
-        has_crossing = _crosses_radius_grid(r, r_sample)
-
-        delta_phi_deg = np.full(len(r_sample), np.nan)
-        delta_phi_deg[has_crossing] = np.degrees(
-            phi_ray_at_sample[has_crossing] - phi_geo_at_sample[has_crossing]
-        )
-
-        error_data.append((delta_b, r_sample, delta_phi_deg))
+        error_data.append((delta_b_ratio, r_sample, delta_phi_deg))
 
 
     ax_traj.add_patch(Circle(
@@ -332,7 +420,7 @@ def create_error_analysis_figure(
     sm1 = plt.cm.ScalarMappable(cmap=cmap_rays, norm=norm_rays)
     sm1.set_array([])
     cbar1 = plt.colorbar(sm1, ax=ax_traj)
-    cbar1.set_label('|Δb| / M', fontsize=12)
+    cbar1.set_label('|Δb| / |b_ref|', fontsize=12)
 
     print("Building angular-deviation contour plot...")
 
@@ -346,29 +434,40 @@ def create_error_analysis_figure(
             error_grid  = np.full((len(db_grid), len(r_grid)), np.nan)
 
             for i, (delta_b, r_vals, err_vals) in enumerate(error_data):
-                # r_vals is already monotonically increasing (linspace), so np.interp is safe
+                # r_vals is already monotonically increasing, so np.interp is safe.
                 error_grid[i, :] = np.interp(
                     r_grid, r_vals, err_vals, left=np.nan, right=np.nan
                 )
 
             error_masked = np.ma.masked_invalid(error_grid)
 
-            cmap_err = plt.cm.PuOr_r.copy()
-            cmap_err.set_bad(color='black')
-            ax_error.set_facecolor('black')
+            cmap_err = plt.cm.PuOr.copy()
+            cmap_err.set_bad(color='0.85')
+            ax_error.set_facecolor('0.85')
             finite_errors = error_grid[np.isfinite(error_grid)]
 
             if finite_errors.size > 0:
+                err_vmin, err_vmax = _symmetric_error_scale(finite_errors)
+                err_levels = np.linspace(err_vmin, err_vmax, 13)
+                err_ticks = np.linspace(err_vmin, err_vmax, 7)
+                clipped_errors = np.ma.masked_invalid(
+                    np.clip(error_masked, err_vmin, err_vmax)
+                )
+
                 contour = ax_error.contourf(
                     r_grid,
                     db_grid,
-                    error_masked,
-                    levels=20,
+                    clipped_errors,
+                    levels=err_levels,
                     cmap=cmap_err,
-                    norm=Normalize(vmin=finite_errors.min(), vmax=finite_errors.max()),
+                    extend='both',
                     corner_mask=False,
                 )
-                cbar2 = plt.colorbar(contour, ax=ax_error)
+                cbar2 = plt.colorbar(
+                    contour,
+                    ax=ax_error,
+                    ticks=err_ticks,
+                )
                 cbar2.set_label('Φ_ray − Φ_geo  (degrees)', fontsize=12)
 
             ax_error.axhline(y=0, color='white', linestyle='--', linewidth=2, alpha=0.8,
@@ -386,7 +485,7 @@ def create_error_analysis_figure(
             ax_error.legend(fontsize=10)
 
     ax_error.set_xlabel('r / M', fontsize=14)
-    ax_error.set_ylabel('Δb / M', fontsize=14)
+    ax_error.set_ylabel('Δb / |b_ref|', fontsize=14)
     ax_error.set_title('Angular Deviation from Geodesic', fontsize=14)
     ax_error.grid(True, alpha=0.3)
 
@@ -429,7 +528,8 @@ def main():
     print(f"\nSimulation parameters:")
     print(f"  Metric:           {METRIC_TYPE}")
     print(f"  b_nominal:        {B_NOMINAL}")
-    print(f"  delta_b range:    [{DELTA_B_MIN}, {DELTA_B_MAX}]")
+    print(f"  delta_b / |b_ref| range: [{DELTA_B_RATIO_MIN}, {DELTA_B_RATIO_MAX}]")
+    print(f"  delta_b range:           [{DELTA_B_MIN}, {DELTA_B_MAX}]")
     print(f"  N_DELTA_VALUES:   {N_DELTA_VALUES}")
     print(f"  R_START:          {R_START}")
     print(f"  R_PLOT_MAX:       {R_PLOT_MAX}")
@@ -438,7 +538,7 @@ def main():
         obh,
         b_nominal=B_NOMINAL,
         actual_event_horizon=actual_event_horizon,
-        delta_b_range=(DELTA_B_MIN, DELTA_B_MAX),
+        delta_b_ratio_range=(DELTA_B_RATIO_MIN, DELTA_B_RATIO_MAX),
         n_delta_values=N_DELTA_VALUES,
     )
 

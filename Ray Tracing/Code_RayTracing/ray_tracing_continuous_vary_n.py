@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from matplotlib.collections import LineCollection
-from matplotlib.colors import Normalize, TwoSlopeNorm
+from matplotlib.colors import Normalize
 import warnings
 
 from Kerr_Newman import refractive_index_kn_continuous, kerr_newman_radius, kerr_newman_photon_sphere, kerr_newman_discontinuity_radius
@@ -10,15 +10,15 @@ from Schwarzchild import refractive_index_schwarzschild
 from geodesics import schwarzschild_geodesic_xy, kerr_newman_geodesic_xy
 
 
-METRIC_TYPE = "schwarzschild"   # options: "schwarzschild", "kerr_newman"
+METRIC_TYPE = "kerr_newman"   # options: "schwarzschild", "kerr_newman"
 
-B_FIXED = 3.5            # Impact parameter for base refractive index
+B_FIXED = 5.409            # Impact parameter for base refractive index
 R_HORIZON = 2.0            # Schwarzschild radius (event horizon)
 R_START = 500                # Starting radius (outer boundary), must be very far to be in the asymptotic regime
 R_PLOT_MAX = 6.0           # Maximum radius for plotting refractive index profile
 
-KERR_A = 0.4              # Angular momentum parameter (a)
-KERR_CHARGE = 0.8         # Charge parameter (Q)
+KERR_A = 0              # Angular momentum parameter (a)
+KERR_CHARGE = 1.0         # Charge parameter (Q)
 
 
 STEP_SIZE = 0.05           # Step size in affine parameter (ds)
@@ -191,6 +191,86 @@ def _crosses_radius_grid(r_array, r_grid):
     return np.any((r_grid[:, None] >= seg_min) & (r_grid[:, None] <= seg_max), axis=1)
 
 
+def compute_geodesic_error_reference(b_fixed, actual_event_horizon):
+    """
+    Geodesic in the same convention used by other_methods:
+    rho starts at R_PLOT_MAX and phi starts from 0 at that radius.
+    """
+    if METRIC_TYPE == "schwarzschild":
+        _, _, r_geo, phi_geo = schwarzschild_geodesic_xy(
+            b_inf=b_fixed,
+            P0=R_PLOT_MAX,
+            P_end=R_HORIZON,
+        )
+
+    elif METRIC_TYPE == "kerr_newman":
+        ell_sign = int(np.sign(b_fixed)) if b_fixed != 0 else +1
+        geo_end = actual_event_horizon if actual_event_horizon is not None else R_HORIZON
+        _, _, r_geo, phi_geo = kerr_newman_geodesic_xy(
+            a=KERR_A,
+            rho_Q=KERR_CHARGE,
+            b_inf=b_fixed,
+            ell_sign=ell_sign,
+            P0=R_PLOT_MAX,
+            P_end=geo_end,
+        )
+    else:
+        raise ValueError("Unknown METRIC_TYPE")
+
+    min_r_idx = np.argmin(r_geo)
+    return r_geo[:min_r_idx + 1], phi_geo[:min_r_idx + 1]
+
+
+def _ray_error_coordinates(x_path, y_path, r_outer=R_PLOT_MAX):
+    """
+    Convert a Cartesian continuous ray to the rho/phi convention used by
+    other_methods.ray_trace: ingoing branch only, phi=0 at r_outer.
+    """
+    r_path = np.sqrt(x_path**2 + y_path**2)
+    min_r_idx = np.argmin(r_path)
+
+    r_ing = r_path[:min_r_idx + 1]
+    theta_ing = np.unwrap(np.arctan2(y_path[:min_r_idx + 1], x_path[:min_r_idx + 1]))
+
+    if len(r_ing) < 2 or r_ing.min() >= r_outer:
+        return np.array([]), np.array([])
+
+    sort_idx = np.argsort(r_ing)
+    r_sorted = r_ing[sort_idx]
+    theta_sorted = theta_ing[sort_idx]
+
+    theta_outer = np.interp(r_outer, r_sorted, theta_sorted)
+    keep = r_ing <= r_outer
+
+    r_ray = np.concatenate(([r_outer], r_ing[keep]))
+    phi_ray = np.concatenate(([0.0], theta_outer - theta_ing[keep]))
+
+    order = np.argsort(r_ray)
+    _, unique_idx = np.unique(r_ray[order], return_index=True)
+    keep_order = order[unique_idx]
+
+    return r_ray[keep_order], phi_ray[keep_order]
+
+
+def _positive_error_scale(finite_errors, min_span=1.0, max_span=10.0, percentile=98.0):
+    """
+    Return a dynamic positive color scale for absolute angular errors.
+    The upper limit follows the data, but never exceeds the requested cap.
+    """
+    if finite_errors.size == 0:
+        return 0.0, min_span
+
+    upper = np.nanpercentile(finite_errors, percentile)
+    if not np.isfinite(upper) or upper == 0:
+        upper = np.nanmax(finite_errors)
+
+    if not np.isfinite(upper) or upper == 0:
+        upper = min_span
+
+    upper = min(max(upper, min_span), max_span)
+    return 0.0, upper
+
+
 def create_error_analysis_plot(obh, delta_n_range=(DELTA_N_MIN, DELTA_N_MAX),
                                 n_delta_values=N_DELTA_VALUES, b_fixed=B_FIXED, actual_event_horizon=None):
     
@@ -225,6 +305,10 @@ def create_error_analysis_plot(obh, delta_n_range=(DELTA_N_MIN, DELTA_N_MAX),
 
     x_geo = -x_geo
     phi_geo = np.pi - phi_geo
+    r_geo_error, phi_geo_error = compute_geodesic_error_reference(
+        b_fixed,
+        actual_event_horizon,
+    )
 
     print(f"Tracing {n_delta_values} rays for error analysis...")
     traced_rays = []
@@ -277,47 +361,60 @@ def create_error_analysis_plot(obh, delta_n_range=(DELTA_N_MIN, DELTA_N_MAX),
 
     r_grid = np.linspace(obh.r_horizon, R_PLOT_MAX, 300)
     heat_matrix = np.full((len(delta_n_values), len(r_grid)), np.nan)
-    phi_geo_at_grid = _interp_phi_at_r(r_grid, r_geo, phi_geo)
 
     for i, (delta_n, x, y, _) in enumerate(traced_rays):
-        r_ray   = np.sqrt(x**2 + y**2)
-        phi_ray = np.arctan2(y, x)
+        r_ing, phi_ing = _ray_error_coordinates(x, y)
 
-        if len(r_ray) < 2:
+        if len(r_ing) < 2:
             continue
 
-        sort_idx = np.argsort(r_ray)
-        phi_ray_at_grid = np.interp(r_grid, r_ray[sort_idx], phi_ray[sort_idx])
-        has_crossing = _crosses_radius_grid(r_ray, r_grid)
-        heat_matrix[i, has_crossing] = np.degrees(
-            _wrap_angle(phi_ray_at_grid[has_crossing] - phi_geo_at_grid[has_crossing])
+        r_common_min = max(r_geo_error.min(), r_ing.min())
+        r_common_max = min(r_geo_error.max(), r_ing.max())
+
+        if r_common_min >= r_common_max:
+            continue
+
+        common_mask = ((r_ing >= r_common_min)
+                       & (r_ing <= r_common_max))
+        r_sample = r_ing[common_mask]
+        phi_ray_at_sample = phi_ing[common_mask]
+        phi_geo_at_ray = np.interp(r_sample, r_geo_error[::-1], phi_geo_error[::-1])
+        delta_phi_deg = np.abs(np.degrees(phi_ray_at_sample - phi_geo_at_ray))
+
+        sort_idx = np.argsort(r_sample)
+        heat_matrix[i, :] = np.interp(
+            r_grid,
+            r_sample[sort_idx],
+            delta_phi_deg[sort_idx],
+            left=np.nan,
+            right=np.nan,
         )
 
     error_masked = np.ma.masked_invalid(heat_matrix)
-    cmap_err = plt.cm.PuOr_r.copy()
-    cmap_err.set_bad(color='black')
-    ax2.set_facecolor('black')
-    finite_errors = heat_matrix[np.isfinite(heat_matrix)]
+    finite_errors = error_masked.compressed()
+    error_lower, error_upper = _positive_error_scale(
+        finite_errors,
+        min_span=1.0,
+        max_span=10.0,
+    )
+    error_levels = np.linspace(error_lower, error_upper, 16)
+    error_ticks = np.linspace(error_lower, error_upper, 6)
 
-    if finite_errors.size > 0:
-        error_min = finite_errors.min()
-        error_max = finite_errors.max()
-        if error_min >= 0.0:
-            error_min = -error_max if error_max > 0.0 else -1.0
-        if error_max <= 0.0:
-            error_max = -error_min if error_min < 0.0 else 1.0
+    cmap_err = plt.cm.Purples.copy()
+    cmap_err.set_bad(color='0.85')
+    ax2.set_facecolor('0.85')
 
-        pcm = ax2.contourf(
-            r_grid,
-            delta_n_values,
-            error_masked,
-            levels=20,
-            cmap=cmap_err,
-            norm=TwoSlopeNorm(vmin=error_min, vcenter=0.0, vmax=error_max),
-            corner_mask=False,
-        )
-        cbar2 = plt.colorbar(pcm, ax=ax2)
-        cbar2.set_label(r'$\Phi_{\rm ray} - \Phi_{\rm geo}$ (°)', fontsize=11)
+    pcm = ax2.contourf(
+        r_grid,
+        delta_n_values,
+        np.ma.masked_invalid(np.clip(error_masked, error_lower, error_upper)),
+        levels=error_levels,
+        cmap=cmap_err,
+        extend='max',
+        corner_mask=False,
+    )
+    cbar2 = plt.colorbar(pcm, ax=ax2, ticks=error_ticks, format='%.3g')
+    cbar2.set_label(r'$\Phi_{\rm ray} - \Phi_{\rm geo}$ (°)', fontsize=11)
 
     ax2.axvline(x=obh.r_horizon, color='white', linestyle='--', linewidth=1.2,
                 alpha=0.8, label='Simulated BH')
